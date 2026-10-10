@@ -257,7 +257,9 @@ def caller_run_id(kwargs: Dict[str, Any]) -> Optional[str]:
     return value
 
 
-async def aenqueue_run_job(queue_worker: Any, job: Dict[str, Any], caller_supplied_id: bool) -> Dict[str, Any]:
+async def aenqueue_run_job(
+    queue_worker: Any, job: Dict[str, Any], caller_supplied_id: bool, run_db: Any = None
+) -> Dict[str, Any]:
     """enqueue_job, answering a repeated caller-supplied run id like a
     repeated Idempotency-Key: the original ticket comes back as the
     duplicate, so the route answers with the original run.
@@ -266,12 +268,16 @@ async def aenqueue_run_job(queue_worker: Any, job: Dict[str, Any], caller_suppli
     never collide), so the ticket is looked up before the insert, and again
     when a concurrent submission of the same id wins it. Run ids share one
     namespace across users, unlike Idempotency-Keys: a ticket another user
-    submitted is refused, never attached to."""
+    submitted is refused, never attached to. So is an id a run outside the
+    queue already holds in ``run_db``, since executing under it would
+    overwrite that run."""
     store = queue_worker.store
     if caller_supplied_id:
         existing = await store.get_job(job["id"])
         if existing is not None:
             return _caller_run_id_duplicate(existing, job)
+        if await _arun_row_exists(run_db, job["id"]):
+            _refuse_caller_run_id(job, "a run outside the queue already has it")
     try:
         return await store.enqueue_job(job, max_depth=queue_worker.config.max_queue_depth)
     except Exception:
@@ -287,11 +293,27 @@ async def aenqueue_run_job(queue_worker: Any, job: Dict[str, Any], caller_suppli
 
 def _caller_run_id_duplicate(existing: Dict[str, Any], job: Dict[str, Any]) -> Dict[str, Any]:
     if existing.get("user_id") != job.get("user_id"):
-        from fastapi import HTTPException
-
-        log_warning(f"run_id {job['id']} was resubmitted by another user than its ticket's; refusing with 409")
-        raise HTTPException(status_code=409, detail="run_id is already in use; submit with a different run_id")
+        _refuse_caller_run_id(job, "another user's ticket has it")
     return {"accepted": False, "reason": "duplicate", "job": existing}
+
+
+def _refuse_caller_run_id(job: Dict[str, Any], reason: str) -> None:
+    from fastapi import HTTPException
+
+    log_warning(f"Refused caller-supplied run_id {job['id']} with 409: {reason}")
+    raise HTTPException(status_code=409, detail="run_id is already in use; submit with a different run_id")
+
+
+async def _arun_row_exists(db: Any, run_id: str) -> bool:
+    """Whether ``db`` holds a run row under ``run_id``. Adapters without v3
+    run storage return None from get_run, so they read as free."""
+    from agno.db.base import AsyncBaseDb, BaseDb
+
+    if isinstance(db, AsyncBaseDb):
+        return await db.get_run(run_id, deserialize=False) is not None
+    if isinstance(db, BaseDb):
+        return db.get_run(run_id, deserialize=False) is not None
+    return False
 
 
 # Payload key for the version of a stored agent (one the AgentOS db defines,

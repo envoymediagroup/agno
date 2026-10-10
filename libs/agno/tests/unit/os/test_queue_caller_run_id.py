@@ -33,7 +33,7 @@ def harness(tmp_path):
     store = InMemoryQueueStore()
     app.state.queue_worker = SimpleNamespace(store=store, config=QueueConfig(durable=True))
     client = TestClient(app, raise_server_exceptions=False)
-    return SimpleNamespace(store=store, client=client)
+    return SimpleNamespace(store=store, client=client, db=db)
 
 
 def submit(client: TestClient, path: str, run_id: str, stream: bool = False, **fields: str) -> Any:
@@ -84,6 +84,21 @@ class TestNonStreamingSubmission:
         assert response.status_code == 409
         assert "different component" in response.json()["detail"]
         assert harness.store._jobs["run-1"]["component_type"] == "agent"
+
+    def test_a_run_id_a_run_outside_the_queue_holds_is_refused(self, harness):
+        from agno.session import AgentSession
+
+        harness.db.upsert_session(AgentSession(session_id="inline-session", agent_id="qa-agent", user_id="alice"))
+        inline_run = RunOutput(
+            run_id="run-1", session_id="inline-session", agent_id="qa-agent", status=RunStatus.completed
+        )
+        harness.db.upsert_run(inline_run, session_id="inline-session", user_id="alice", run_index=0)
+
+        response = submit(harness.client, "/agents/qa-agent/runs", "run-1", user_id="bob")
+
+        assert response.status_code == 409
+        assert "alice" not in response.json()["detail"]
+        assert harness.store._jobs == {}
 
     def test_an_overlong_run_id_is_refused(self, harness):
         response = submit(harness.client, "/agents/qa-agent/runs", "r" * 513)
