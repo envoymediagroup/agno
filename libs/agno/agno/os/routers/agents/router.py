@@ -42,13 +42,16 @@ from agno.os.auth import (
 from agno.os.checkpoints import build_run_checkpoint_snapshot, list_run_checkpoints
 from agno.os.event_streams import get_event_stream
 from agno.os.job_queue import (
+    QUEUED_COMPONENT_VERSION_KEY,
     acontinue_via_queue,
     aprepare_accepted_or_abort,
     araise_if_ticket_owns_continue,
     aticket_poll_fallback,
     ensure_duplicate_matches_component,
+    is_stored_agent,
     normalize_idempotency_key,
     payload_is_queueable,
+    stored_agent_queue_version,
     ticket_status_to_api,
     validate_seam_input,
 )
@@ -729,12 +732,21 @@ def get_agent_router(
                 log_warning("Metadata parameter passed in both request state and kwargs, using request state")
             kwargs["metadata"] = metadata
 
+        # A stored agent's durable run executes the version its ticket
+        # records. Read that version before resolving and resolve at it, so a
+        # version published meanwhile cannot split what this submission
+        # validates from what the worker runs.
+        stored_version = (
+            stored_agent_queue_version(agent_id, os.agents, os.db, version)
+            if background and getattr(request.app.state, "queue_worker", None) is not None
+            else None
+        )
         agent = await resolve_agent(
             agent_id,
             os.agents,
             os.db,
             registry,
-            version=version,
+            version=stored_version if stored_version is not None else version,
             request=request,
             user_id=user_id,
             session_id=session_id,
@@ -852,16 +864,26 @@ def get_agent_router(
                 # RUN (complete output guaranteed via the run row); the live
                 # stream is the best-effort view.
                 queue_worker = getattr(request.app.state, "queue_worker", None)
-                queued_stream_payload = {"input": message, "kwargs": kwargs, "stream": True}
+                queued_stream_payload: Dict[str, Any] = {"input": message, "kwargs": kwargs, "stream": True}
+                if stored_version is not None:
+                    queued_stream_payload[QUEUED_COMPONENT_VERSION_KEY] = stored_version
                 stream_queueable = (
                     queue_worker is not None
                     and getattr(agent, "db", None) is not None
                     and payload_is_queueable(queued_stream_payload)
-                    and version is None
                     and not (base64_images or base64_audios or base64_videos or input_files)
-                    and any(
-                        getattr(candidate, "id", None) == agent_id and not isinstance(candidate, AgentFactory)
-                        for candidate in (os.agents or [])
+                    and (
+                        # A stored agent rides at the version this submission
+                        # resolved; a code-defined one must be its plain,
+                        # unpinned registry instance
+                        stored_version is not None
+                        or (
+                            version is None
+                            and any(
+                                getattr(candidate, "id", None) == agent_id and not isinstance(candidate, AgentFactory)
+                                for candidate in (os.agents or [])
+                            )
+                        )
                     )
                 )
                 if stream_queueable:
@@ -967,19 +989,20 @@ def get_agent_router(
             # replica's worker claims the job executes it, surviving crashes
             # and deploys. Client contract identical: 202 + poll.
             queue_worker = getattr(request.app.state, "queue_worker", None)
-            # Queueable only if the agent is a plain registry instance: the
-            # worker resolves from the registry, so factory-backed or
-            # off-registry (db-resolved / version-pinned) components would be
-            # accepted here and then fail or run differently in the worker.
+            # Queueable only if the worker resolves the same agent: a plain
+            # registry instance (factory-backed or version-pinned resolution
+            # differs from the worker's registry instance), or a stored agent,
+            # whose ticket carries the version this submission resolved.
             agent_is_queueable = any(
                 getattr(candidate, "id", None) == agent_id and not isinstance(candidate, AgentFactory)
                 for candidate in (os.agents or [])
             )
-            queued_payload = {"input": message, "kwargs": kwargs}
+            queued_payload: Dict[str, Any] = {"input": message, "kwargs": kwargs}
+            if stored_version is not None:
+                queued_payload[QUEUED_COMPONENT_VERSION_KEY] = stored_version
             if (
                 queue_worker is not None
-                and agent_is_queueable
-                and version is None  # version-pinned resolution differs from the worker's registry instance
+                and ((agent_is_queueable and version is None) or stored_version is not None)
                 and payload_is_queueable(queued_payload)
                 # Media cannot ride the queue payload yet: fall back to the
                 # bounded in-process path (parity with the stream seam) rather
@@ -1057,15 +1080,15 @@ def get_agent_router(
                         "Executing on the accepting replica instead - bounded and observable, but NOT durable."
                     )
                 else:
-                    # Off-registry, factory-backed, or version-pinned: the
-                    # worker resolves from the registry, so these cannot ride
-                    # the queue - previously this dropped to the non-durable
-                    # path with no log line at all.
+                    # Factory-backed, version-pinned code-defined, or an
+                    # agent the worker cannot reload from the AgentOS db:
+                    # these cannot ride the queue - previously this dropped
+                    # to the non-durable path with no log line at all.
                     log_warning(
-                        "Background run bypasses the durable queue: the agent is not a plain "
-                        "registry instance (remote, factory-backed, db-resolved, or version-pinned "
-                        "resolution differs from the worker's registry instance). Executing on the "
-                        "accepting replica instead - bounded and observable, but NOT durable."
+                        "Background run bypasses the durable queue: the agent is neither a plain "
+                        "registry instance nor a stored agent the worker can reload (factory-backed, "
+                        "version-pinned code-defined, or an AgentOS db without stored components). "
+                        "Executing on the accepting replica instead - bounded and observable, but NOT durable."
                     )
 
             # Same input-error contract as the inline path: schema violations
@@ -1563,7 +1586,7 @@ def get_agent_router(
             agent_is_queueable = any(
                 getattr(candidate, "id", None) == agent_id and not isinstance(candidate, AgentFactory)
                 for candidate in (os.agents or [])
-            )
+            ) or is_stored_agent(agent_id, os.agents, os.db)
             if (
                 queue_worker is not None
                 and not isinstance(agent, RemoteAgent)
