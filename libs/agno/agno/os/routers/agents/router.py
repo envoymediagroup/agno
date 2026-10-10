@@ -45,10 +45,11 @@ from agno.os.job_queue import (
     _new_queued_run_id,
     aattach_waiting_on,
     acontinue_via_queue,
-    aenqueue_ticket,
+    aenqueue_run_ticket,
     aprepare_accepted_or_abort,
     araise_if_ticket_owns_continue,
     aticket_poll_fallback,
+    caller_run_id,
     component_is_queueable,
     ensure_duplicate_matches_component,
     normalize_idempotency_key,
@@ -937,7 +938,8 @@ def get_agent_router(
                     from agno.os.event_streams import get_event_stream as _ges
                     from agno.run.base import RunStatus as _RS
 
-                    queued_run_id = _new_queued_run_id()
+                    queued_caller_run_id = caller_run_id(kwargs)
+                    queued_run_id = queued_caller_run_id or _new_queued_run_id()
                     queued_session_id = session_id  # non-empty: defaulted at the top of the endpoint
                     queued_stream_payload["scope"] = resolve_queue_scope(
                         agent_id,
@@ -961,7 +963,13 @@ def get_agent_router(
                         deployment_id=queue_worker.config.deployment_id,
                         idempotency_key=normalize_idempotency_key(request.headers.get("idempotency-key")),
                     ).to_dict()
-                    enqueue_result = await aenqueue_ticket(queue_worker, job, agent)
+                    enqueue_result = await aenqueue_run_ticket(
+                        queue_worker,
+                        job,
+                        agent,
+                        caller_supplied_id=queued_caller_run_id is not None,
+                        run_db=getattr(agent, "db", None),
+                    )
                     if enqueue_result["reason"] == "queue_full":
                         raise HTTPException(status_code=429, detail="Job queue is full")
                     if enqueue_result["reason"] == "duplicate":
@@ -973,13 +981,13 @@ def get_agent_router(
                             )
                         ensure_duplicate_matches_component(existing, "agent", job["component_id"], version=version)
                         if not (existing.get("payload") or {}).get("stream"):
-                            # The key was used by a NON-stream submission: its
+                            # The original submission was NON-stream: its
                             # run never registers in the event stream, so a
                             # tail would close instantly and silently. Refuse
                             # honestly instead.
                             raise HTTPException(
                                 status_code=409,
-                                detail="Idempotency-Key was used by a non-streaming submission; "
+                                detail="The original submission was not streaming; "
                                 f"poll run {existing['id']} instead of attaching a stream",
                             )
                         # Attach to the ORIGINAL run's stream. A terminal
@@ -1060,7 +1068,8 @@ def get_agent_router(
             ):
                 # 202 must honor input_schema exactly like the inline path (400)
                 validate_seam_input(agent, message)
-                queued_run_id = _new_queued_run_id()
+                queued_caller_run_id = caller_run_id(kwargs)
+                queued_run_id = queued_caller_run_id or _new_queued_run_id()
                 queued_session_id = session_id  # non-empty: defaulted at the top of the endpoint
                 queued_payload["scope"] = resolve_queue_scope(
                     agent_id,
@@ -1088,7 +1097,13 @@ def get_agent_router(
                 # Enqueue FIRST: the committed queue row is the acceptance.
                 # Rejected or duplicate submissions must leave no phantom
                 # PENDING run behind in the session.
-                enqueue_result = await aenqueue_ticket(queue_worker, job, agent)
+                enqueue_result = await aenqueue_run_ticket(
+                    queue_worker,
+                    job,
+                    agent,
+                    caller_supplied_id=queued_caller_run_id is not None,
+                    run_db=getattr(agent, "db", None),
+                )
                 if enqueue_result["reason"] == "queue_full":
                     raise HTTPException(status_code=429, detail="Job queue is full")
                 if enqueue_result["reason"] == "duplicate" and enqueue_result["job"] is not None:
