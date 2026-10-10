@@ -153,6 +153,11 @@ class Compaction:
     # With enforce_min_fold_ratio, the folded span must be at least this many times the kept tail.
     min_fold_ratio: float = 2.0
 
+    # Characters of the folded history one summary call reads, newest first. Older messages past
+    # it never reach the summarizer, though they are still archived. The default fits a fold at
+    # the default compact_at_tokens; raise it with the threshold, within the summarizer's window.
+    summarize_char_budget: int = DEFAULT_SUMMARIZE_CHAR_BUDGET
+
     stats: CompactionStats = field(default_factory=CompactionStats)
 
     def __post_init__(self) -> None:
@@ -198,6 +203,8 @@ class Compaction:
             raise ValueError(f"uncompacted_tokens must be a positive integer, got {self.uncompacted_tokens}")
         if self.compacted_token_budget is not None and self.compacted_token_budget <= 0:
             raise ValueError(f"compacted_token_budget must be a positive integer, got {self.compacted_token_budget}")
+        if self.summarize_char_budget <= 0:
+            raise ValueError(f"summarize_char_budget must be a positive integer, got {self.summarize_char_budget}")
         # The tail limit divides by 1 + min_fold_ratio, so a negative ratio would divide by zero or
         # flip the limit's sign.
         if self.min_fold_ratio < 0:
@@ -516,7 +523,7 @@ class Compaction:
         characters the summarizer never receives.
         """
         kept: List[Message] = []
-        budget = DEFAULT_SUMMARIZE_CHAR_BUDGET
+        budget = self.summarize_char_budget
         for message in reversed(messages):
             size = len(render_message(message)) + 2  # + the block separator
             if budget - size < 0 and kept:

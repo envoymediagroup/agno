@@ -2942,6 +2942,45 @@ def test_a_single_oversized_message_still_gets_summarized():
     assert Compaction()._trim_for_summary(messages) == messages
 
 
+def test_summarize_char_budget_bounds_what_the_summarizer_reads():
+    """The summarizer's input budget is a setting: a fold over more history than it allows
+    hands the summarizer only the newest messages that fit."""
+    messages = _runs_of(12)
+    model = _StubModel()
+
+    record = Compaction(
+        compact_at_tokens=None,
+        uncompacted_runs=1,
+        store_compacted_messages=False,
+        summarize_char_budget=10_000,
+        model=model,
+    ).compact(messages, session_id="s")
+
+    assert record is not None
+    assert 0 < len(model.seen) <= 10_000
+    assert "question 10 " in model.seen
+    assert "question 0 " not in model.seen
+
+
+def test_the_default_summarize_char_budget_reads_a_fold_that_fits_whole():
+    """Unset, the budget is 400,000 characters, so a fold well under it reaches the summarizer whole."""
+    messages = _runs_of(12)
+    model = _StubModel()
+
+    Compaction(compact_at_tokens=None, uncompacted_runs=1, store_compacted_messages=False, model=model).compact(
+        messages, session_id="s"
+    )
+
+    assert "question 0 " in model.seen
+    assert "question 10 " in model.seen
+
+
+@pytest.mark.parametrize("budget", [0, -1])
+def test_rejects_non_positive_summarize_char_budget(budget):
+    with pytest.raises(ValueError, match="summarize_char_budget"):
+        Compaction(summarize_char_budget=budget)
+
+
 # --- previous-record resolution ---------------------------------------------
 
 
