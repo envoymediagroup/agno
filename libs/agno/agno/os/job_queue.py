@@ -344,7 +344,8 @@ class QueueWorker:
       the run row FIRST so pollers never see a stuck RUNNING run,
     - enforces the per-run timeout,
     - drains on stop: in-flight runs get stop_timeout to finish, stragglers
-      are cancelled and requeued/failed via the fenced retry path.
+      are cancelled and requeued/failed via the fenced retry path,
+    - pauses claiming on request (pause_claiming) while it keeps running.
     """
 
     def __init__(
@@ -378,6 +379,8 @@ class QueueWorker:
                 "Raise lock_grace_seconds or lower stop_timeout."
             )
         self._running = False
+        self._claiming_paused = False
+        self._claim_pending = False
         self._task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._heartbeat_thread: Optional[Any] = None
@@ -602,6 +605,35 @@ class QueueWorker:
             self._heartbeat_stop = None
         log_info("Job queue worker stopped")
 
+    def pause_claiming(self) -> None:
+        """Stop claiming jobs without stopping the worker.
+
+        Runs in flight keep executing with live leases, and the worker keeps
+        sweeping; jobs enqueued meanwhile wait for another replica's worker or
+        for resume_claiming(). A replica that is being replaced can pause, let
+        in_flight_count reach zero, and then stop with nothing to drain.
+        """
+        if not self._claiming_paused:
+            self._claiming_paused = True
+            log_info(f"Job queue worker paused claiming: worker={self.worker_id}")
+
+    def resume_claiming(self) -> None:
+        """Claim jobs again after pause_claiming()."""
+        if self._claiming_paused:
+            self._claiming_paused = False
+            log_info(f"Job queue worker resumed claiming: worker={self.worker_id}")
+
+    @property
+    def claiming_paused(self) -> bool:
+        return self._claiming_paused
+
+    @property
+    def in_flight_count(self) -> int:
+        """Runs this worker is executing now, counting a claim still under way:
+        a claim that started before pause_claiming() may yet return a job."""
+        executing = sum(1 for task in list(self._in_flight.values()) if not task.done())
+        return executing + (1 if self._claim_pending else 0)
+
     async def _poll_loop(self) -> None:
         import time as _time
 
@@ -650,7 +682,7 @@ class QueueWorker:
 
     async def _claim_burst(self) -> None:
         """Claim until the concurrency cap is reached or the queue is drained."""
-        while self._running:
+        while self._running and not self._claiming_paused:
             self._prune_in_flight()
             # None = not explicitly configured: fall back to the process
             # setting (env var or library default), same semantics as the
@@ -662,12 +694,20 @@ class QueueWorker:
                 effective_max = get_background_max_concurrency()
             if effective_max > 0 and len(self._in_flight) >= effective_max:
                 break
-            job = await self.store.claim_job(self.worker_id, self.config.lock_grace_seconds, self.config.deployment_id)
-            if job is None:
-                break
-            task = asyncio.create_task(self._execute_claimed(job))
-            job_id = job["id"]
-            self._in_flight[job_id] = task
+            # Until the claimed job is registered in _in_flight below (no
+            # await in between), the claim itself counts as in flight
+            self._claim_pending = True
+            try:
+                job = await self.store.claim_job(
+                    self.worker_id, self.config.lock_grace_seconds, self.config.deployment_id
+                )
+                if job is None:
+                    break
+                task = asyncio.create_task(self._execute_claimed(job))
+                job_id = job["id"]
+                self._in_flight[job_id] = task
+            finally:
+                self._claim_pending = False
 
             def _discard(_task: asyncio.Task, jid: str = job_id) -> None:
                 self._in_flight.pop(jid, None)
