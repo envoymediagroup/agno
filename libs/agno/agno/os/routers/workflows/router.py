@@ -39,9 +39,11 @@ from agno.os.auth import (
 from agno.os.event_streams import get_event_stream
 from agno.os.job_queue import (
     acontinue_via_queue,
+    aenqueue_run_job,
     aprepare_accepted_or_abort,
     araise_if_ticket_owns_continue,
     aticket_poll_fallback,
+    caller_run_id,
     ensure_duplicate_matches_component,
     normalize_idempotency_key,
     payload_is_queueable,
@@ -1839,7 +1841,8 @@ def get_workflow_router(
                     assert queue_worker is not None  # narrowed by stream_queueable
                     from agno.run.base import RunStatus as _RS
 
-                    queued_run_id = str(uuid4())
+                    queued_caller_run_id = caller_run_id(kwargs)
+                    queued_run_id = queued_caller_run_id or str(uuid4())
                     queued_session_id = session_id  # non-empty: defaulted at the top of the endpoint
                     job = QueuedJob(
                         id=queued_run_id,
@@ -1852,8 +1855,8 @@ def get_workflow_router(
                         deployment_id=queue_worker.config.deployment_id,
                         idempotency_key=normalize_idempotency_key(request.headers.get("idempotency-key")),
                     ).to_dict()
-                    enqueue_result = await queue_worker.store.enqueue_job(
-                        job, max_depth=queue_worker.config.max_queue_depth
+                    enqueue_result = await aenqueue_run_job(
+                        queue_worker, job, caller_supplied_id=queued_caller_run_id is not None
                     )
                     if enqueue_result["reason"] == "queue_full":
                         raise HTTPException(status_code=429, detail="Job queue is full")
@@ -1866,13 +1869,13 @@ def get_workflow_router(
                             )
                         ensure_duplicate_matches_component(existing, "workflow", job["component_id"])
                         if not (existing.get("payload") or {}).get("stream"):
-                            # The key was used by a NON-stream submission: its
+                            # The original submission was NON-stream: its
                             # run never registers in the event stream, so a
                             # tail would close instantly and silently. Refuse
                             # honestly instead.
                             raise HTTPException(
                                 status_code=409,
-                                detail="Idempotency-Key was used by a non-streaming submission; "
+                                detail="The original submission was not streaming; "
                                 f"poll run {existing['id']} instead of attaching a stream",
                             )
                         # Attach to the ORIGINAL run's stream. A terminal
@@ -1944,7 +1947,8 @@ def get_workflow_router(
             ):
                 # 202 must honor input_schema exactly like the inline path (400)
                 validate_seam_input(workflow, message)
-                queued_run_id = str(uuid4())
+                queued_caller_run_id = caller_run_id(kwargs)
+                queued_run_id = queued_caller_run_id or str(uuid4())
                 queued_session_id = session_id  # non-empty: defaulted at the top of the endpoint
                 job = QueuedJob(
                     id=queued_run_id,
@@ -1961,8 +1965,8 @@ def get_workflow_router(
                 # Enqueue FIRST: the committed queue row is the acceptance.
                 # Rejected or duplicate submissions must leave no phantom
                 # PENDING run behind in the session.
-                enqueue_result = await queue_worker.store.enqueue_job(
-                    job, max_depth=queue_worker.config.max_queue_depth
+                enqueue_result = await aenqueue_run_job(
+                    queue_worker, job, caller_supplied_id=queued_caller_run_id is not None
                 )
                 if enqueue_result["reason"] == "queue_full":
                     raise HTTPException(status_code=429, detail="Job queue is full")

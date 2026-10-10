@@ -210,14 +210,14 @@ def ticket_status_to_api(ticket_status: str) -> Optional[str]:
 
 
 def ensure_duplicate_matches_component(existing: Dict[str, Any], component_type: str, component_id: Any) -> None:
-    """Refuse an Idempotency-Key duplicate that belongs to a different component.
+    """Refuse a duplicate (Idempotency-Key or caller run_id) that belongs to a different component.
 
     The dedup namespace is (idempotency_key, user_id) only, so a key reused on
     another component's submit route would otherwise be answered with the
     ORIGINAL component's run - a 202 (or live stream attach) whose ids then 404
     through this route's poll endpoint, because the ticket poll fallback does
-    enforce component identity. Idempotency keys retry the same submission;
-    they never alias a different one.
+    enforce component identity. Idempotency keys and run ids retry the same
+    submission; they never alias a different one.
 
     The response deliberately omits the original ticket's identity: in
     unauthenticated deployments the key namespace is shared across clients,
@@ -228,15 +228,70 @@ def ensure_duplicate_matches_component(existing: Dict[str, Any], component_type:
     from fastapi import HTTPException
 
     log_warning(
-        f"Idempotency-Key reuse across components: key on ticket "
+        f"Idempotency-Key or run_id reuse across components: ticket "
         f"{existing.get('component_type')}/{existing.get('component_id')} was replayed against "
         f"{component_type}/{component_id}; refusing with 409"
     )
     raise HTTPException(
         status_code=409,
-        detail="Idempotency-Key was already used by a different component; "
-        "reuse a key only to retry the identical submission",
+        detail="This Idempotency-Key or run_id was already used by a different component; "
+        "reuse one only to retry the identical submission",
     )
+
+
+def caller_run_id(kwargs: Dict[str, Any]) -> Optional[str]:
+    """The run id a caller supplied as the ``run_id`` form field, or None.
+
+    The inline run paths execute under it, so a durable submission takes it
+    as the ticket's id and the worker executes under it too. It lands in
+    primary-key columns, so it is bounded like Idempotency-Key."""
+    value = kwargs.get("run_id")
+    if value is None or value == "":
+        return None
+    from fastapi import HTTPException
+
+    if not isinstance(value, str):
+        raise HTTPException(status_code=422, detail="run_id must be a string")
+    if len(value) > 512:
+        raise HTTPException(status_code=422, detail="run_id must be at most 512 characters")
+    return value
+
+
+async def aenqueue_run_job(queue_worker: Any, job: Dict[str, Any], caller_supplied_id: bool) -> Dict[str, Any]:
+    """enqueue_job, answering a repeated caller-supplied run id like a
+    repeated Idempotency-Key: the original ticket comes back as the
+    duplicate, so the route answers with the original run.
+
+    The stores reject a reused id as a programming error (server-minted ids
+    never collide), so the ticket is looked up before the insert, and again
+    when a concurrent submission of the same id wins it. Run ids share one
+    namespace across users, unlike Idempotency-Keys: a ticket another user
+    submitted is refused, never attached to."""
+    store = queue_worker.store
+    if caller_supplied_id:
+        existing = await store.get_job(job["id"])
+        if existing is not None:
+            return _caller_run_id_duplicate(existing, job)
+    try:
+        return await store.enqueue_job(job, max_depth=queue_worker.config.max_queue_depth)
+    except Exception:
+        if not caller_supplied_id:
+            raise
+        existing = None
+        with contextlib.suppress(Exception):
+            existing = await store.get_job(job["id"])
+        if existing is None:
+            raise
+        return _caller_run_id_duplicate(existing, job)
+
+
+def _caller_run_id_duplicate(existing: Dict[str, Any], job: Dict[str, Any]) -> Dict[str, Any]:
+    if existing.get("user_id") != job.get("user_id"):
+        from fastapi import HTTPException
+
+        log_warning(f"run_id {job['id']} was resubmitted by another user than its ticket's; refusing with 409")
+        raise HTTPException(status_code=409, detail="run_id is already in use; submit with a different run_id")
+    return {"accepted": False, "reason": "duplicate", "job": existing}
 
 
 # Payload key for the version of a stored agent (one the AgentOS db defines,
