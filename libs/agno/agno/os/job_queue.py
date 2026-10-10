@@ -239,6 +239,42 @@ def ensure_duplicate_matches_component(existing: Dict[str, Any], component_type:
     )
 
 
+# Payload key for the version of a stored agent (one the AgentOS db defines,
+# not a code-defined registry instance) that a queued run executes at.
+QUEUED_COMPONENT_VERSION_KEY = "component_version"
+
+
+def is_stored_agent(agent_id: str, registry_agents: Any, db: Any) -> bool:
+    """True when ``agent_id`` resolves from the AgentOS db, not from a code-defined agent."""
+    from agno.db.base import BaseDb
+
+    return isinstance(db, BaseDb) and not any(
+        getattr(candidate, "id", None) == agent_id for candidate in registry_agents or []
+    )
+
+
+def stored_agent_queue_version(agent_id: str, registry_agents: Any, db: Any, version: Optional[int]) -> Optional[int]:
+    """The version a durable run of a stored agent executes at, or None when
+    ``agent_id`` is a code-defined agent or the db cannot hold stored ones.
+
+    A stored agent has no registry instance for the worker to resolve, so its
+    ticket carries the version this submission resolved - the pinned one,
+    else the component's current version - and the worker loads exactly
+    that version. Every attempt and continuation leg runs it, even after a
+    newer version is published."""
+    if not is_stored_agent(agent_id, registry_agents, db):
+        return None
+    if version is not None:
+        return version
+    try:
+        component = db.get_component(component_id=agent_id)
+    except Exception as e:
+        log_warning(f"Could not read the current version of stored agent {agent_id}: {e}")
+        return None
+    current = component.get("current_version") if isinstance(component, dict) else None
+    return current if isinstance(current, int) and not isinstance(current, bool) else None
+
+
 def payload_is_queueable(payload: Any) -> bool:
     """True when the job payload survives a JSON round-trip as-is.
 
@@ -678,6 +714,20 @@ class QueueWorker:
         for job_id in [jid for jid, t in self._in_flight.items() if t.done()]:
             self._in_flight.pop(job_id, None)
 
+    async def _aresolve_component(self, job: Dict[str, Any]) -> Any:
+        """The component a job runs on. A stored agent's ticket carries the
+        version it runs at, which reaches the resolver as a third argument;
+        the resolver may return an awaitable, since loading a stored agent
+        reads the database."""
+        version = (job.get("payload") or {}).get(QUEUED_COMPONENT_VERSION_KEY)
+        if version is None:
+            resolved = self.resolve_component(job.get("component_type"), job.get("component_id"))
+        else:
+            resolved = self.resolve_component(job.get("component_type"), job.get("component_id"), version)
+        if inspect.isawaitable(resolved):
+            resolved = await resolved
+        return resolved
+
     async def _sweep_exhausted(self) -> None:
         """Fail exhausted stale jobs visibly. Ownership FIRST: acquire the
         stale lock (CAS) before any run-row write - the old order stamped
@@ -772,7 +822,7 @@ class QueueWorker:
         failure path."""
         from agno.run.base import RunStatus
 
-        component = self.resolve_component(job.get("component_type"), job.get("component_id"))
+        component = await self._aresolve_component(job)
         if component is None or not callable(getattr(component, "aget_run_output", None)):
             return False
         try:
@@ -862,7 +912,7 @@ class QueueWorker:
         # refusing the tombstone would loop the ticket in sweep-retry forever
         # instead of honouring the user's cancel; keep the old loud tombstone
         # for exactly that case.
-        component_reachable = self.resolve_component(prior.get("component_type"), prior.get("component_id")) is not None
+        component_reachable = await self._aresolve_component(prior) is not None
         if component_reachable and not await self._persist_run_error(
             prior, reason, status="cancelled", cancellation_stage=stage
         ):
@@ -1118,7 +1168,7 @@ class QueueWorker:
         status: str,
         cancellation_stage: Optional["CancellationStage"] = None,
     ) -> Optional["RunPersistOutcome"]:
-        component = self.resolve_component(job["component_type"], job["component_id"])
+        component = await self._aresolve_component(job)
         if component is None:
             # A deploy removed the component: the run row (if any) is
             # unreachable, so the caller must keep the ticket alive for a
@@ -1537,7 +1587,7 @@ class QueueWorker:
         job_id, attempt = job["id"], job["attempt"]
         job_type = job.get("job_type", "run")
         payload = job.get("payload") or {}
-        component_for_stamp = self.resolve_component(job.get("component_type"), job.get("component_id"))
+        component_for_stamp = await self._aresolve_component(job)
         if (
             job_type == "run"
             and component_for_stamp is not None
@@ -1598,7 +1648,7 @@ class QueueWorker:
             # has no executor for. Fail it visibly rather than guessing.
             await self._asettle_ticket(job_id, attempt, "failed", f"No executor registered for job type {job_type!r}")
             return
-        component = self.resolve_component(job["component_type"], job["component_id"])
+        component = await self._aresolve_component(job)
         if component is None:
             # Same rule as every terminal path: never terminalize the ticket
             # while the run row (prepared PENDING at accept) cannot be
@@ -2458,7 +2508,37 @@ async def queue_lifespan(app: Any, agent_os: Any):
     if isinstance(get_event_stream(), InMemoryEventStream):
         log_warning("Queued-run streams are replica-local; configure queue.redis for cross-replica streaming.")
 
-    def resolve_component(component_type: str, component_id: str) -> Any:
+    def load_stored_agent(component_id: str, version: int) -> Any:
+        """A stored agent at the version its ticket carries, loaded as the
+        run route loads one: strictly, through the AgentOS registry, with
+        the deployment's filesystem isolation applied."""
+        from agno.agent import _init as agent_init
+        from agno.agent.agent import get_agent_by_id
+        from agno.db.base import BaseDb
+        from agno.exceptions import ComponentRehydrationError
+        from agno.os.utils import resolve_ws_deployment_scope_config
+
+        db = getattr(agent_os, "db", None)
+        if not isinstance(db, BaseDb):
+            return None
+        try:
+            agent = get_agent_by_id(
+                db=db,
+                id=component_id,
+                version=version,
+                registry=getattr(agent_os, "registry", None),
+                strict=True,
+                published_only=False,
+            )
+        except ComponentRehydrationError as e:
+            log_error(f"Job queue: stored agent {component_id} version {version} cannot be rehydrated: {e}")
+            return None
+        if agent is not None and (agent.filesystem or agent.tools):
+            _, user_isolation = resolve_ws_deployment_scope_config(app)
+            agent_init.apply_filesystem_user_isolation(agent, user_isolation)
+        return agent
+
+    async def resolve_component(component_type: str, component_id: str, version: Optional[int] = None) -> Any:
         registry = {
             "agent": agent_os.agents,
             "team": agent_os.teams,
@@ -2484,6 +2564,10 @@ async def queue_lifespan(app: Any, agent_os: Any):
                     with contextlib.suppress(Exception):
                         resolved.store_member_responses = True
                 return resolved
+        if component_type == "agent" and version is not None:
+            # The load reads the database: keep it off the event loop that
+            # every in-flight run shares
+            return await asyncio.to_thread(load_stored_agent, component_id, version)
         return None
 
     worker = QueueWorker(
