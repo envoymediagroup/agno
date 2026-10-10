@@ -888,7 +888,10 @@ def get_agent_router(
                         idempotency_key=normalize_idempotency_key(request.headers.get("idempotency-key")),
                     ).to_dict()
                     enqueue_result = await aenqueue_run_job(
-                        queue_worker, job, caller_supplied_id=queued_caller_run_id is not None
+                        queue_worker,
+                        job,
+                        caller_supplied_id=queued_caller_run_id is not None,
+                        run_db=getattr(agent, "db", None),
                     )
                     if enqueue_result["reason"] == "queue_full":
                         raise HTTPException(status_code=429, detail="Job queue is full")
@@ -1010,7 +1013,10 @@ def get_agent_router(
                 # Rejected or duplicate submissions must leave no phantom
                 # PENDING run behind in the session.
                 enqueue_result = await aenqueue_run_job(
-                    queue_worker, job, caller_supplied_id=queued_caller_run_id is not None
+                    queue_worker,
+                    job,
+                    caller_supplied_id=queued_caller_run_id is not None,
+                    run_db=getattr(agent, "db", None),
                 )
                 if enqueue_result["reason"] == "queue_full":
                     raise HTTPException(status_code=429, detail="Job queue is full")
