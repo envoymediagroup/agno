@@ -1490,10 +1490,15 @@ class QueueWorker:
             # would close cleanly and the client would never see the retry's
             # output. Leave the stream open; the retry attempt continues it
             # (dead-producer TTL detection bounds the wait if no retry comes).
+            # A cancelled attempt (drain, timeout) is left open here either
+            # way: _execute_claimed_inner decides whether a retry follows and
+            # closes the stream view when none does.
+            interrupted = isinstance(sys.exc_info()[1], asyncio.CancelledError)
             will_retry = (
                 status == RunStatus.error
                 and job.get("attempt", 1) < job.get("max_attempts", 1)
                 and not self._run_is_not_retryable(final_output)
+                and (interrupted or not self.config.retry_interrupted_only)
             )
             if not will_retry:
                 with contextlib.suppress(Exception):
@@ -2074,6 +2079,20 @@ class QueueWorker:
             )
         return outcome
 
+    def _own_failure_is_final(self, job: Dict[str, Any]) -> bool:
+        """Whether a run that failed on its own (ERROR result, raised error,
+        timeout) ends on this attempt: its budget is spent, or the budget is
+        kept for interrupted runs (QueueConfig.retry_interrupted_only)."""
+        return self.config.retry_interrupted_only or job["attempt"] >= job.get("max_attempts", 1)
+
+    async def _asettle_own_failure(self, job: Dict[str, Any], error: str) -> None:
+        """Settle a run that failed on its own: retried while budget remains,
+        unless only interrupted runs are retried - then it fails here."""
+        if self.config.retry_interrupted_only:
+            await self._asettle_ticket(job["id"], job["attempt"], "failed", error)
+        else:
+            await self._aretry_or_fail_ticket(job["id"], job["attempt"], error, self._retry_delay(job["attempt"]))
+
     async def _execute_claimed(self, job: Dict[str, Any]) -> None:
         from agno.run.concurrency import worker_managed_execution
 
@@ -2396,7 +2415,7 @@ class QueueWorker:
                     )
                     await self._asettle_ticket(job_id, attempt, "failed", error_content)
                 else:
-                    await self._aretry_or_fail_ticket(job_id, attempt, error_content, self._retry_delay(attempt))
+                    await self._asettle_own_failure(job, error_content)
             else:
                 await self._asettle_ticket(job_id, attempt, "completed")
         except asyncio.CancelledError:
@@ -2474,7 +2493,7 @@ class QueueWorker:
             # retry's real output). Budget exhausted = genuinely terminal - and
             # the run-row persist gates the terminal ticket write: on failure
             # the job is left stale for the sweep instead of orphaning the row.
-            if attempt >= job.get("max_attempts", 1):
+            if self._own_failure_is_final(job):
                 if not await self._persist_run_error(job, error):
                     log_error(
                         f"Job queue: could not persist run-row error for timed-out job {job_id}; "
@@ -2482,10 +2501,10 @@ class QueueWorker:
                     )
                     return
                 await self._terminate_stream_view(job)
-            await self._aretry_or_fail_ticket(job_id, attempt, error, self._retry_delay(attempt))
+            await self._asettle_own_failure(job, error)
         except Exception as e:
             permanent = self._is_permanent_failure(e, job.get("component_type") if payload.get("continue") else None)
-            if permanent or attempt >= job.get("max_attempts", 1):
+            if permanent or self._own_failure_is_final(job):
                 # Terminal outcome either way: the run-row persist gates the
                 # terminal ticket write below. On failure, leave the job stale
                 # - budget-exhausted jobs are re-swept; a permanent failure
@@ -2506,7 +2525,7 @@ class QueueWorker:
                 with contextlib.suppress(Exception):
                     await self._terminate_stream_view(job)
             else:
-                await self._aretry_or_fail_ticket(job_id, attempt, str(e), self._retry_delay(attempt))
+                await self._asettle_own_failure(job, str(e))
         finally:
             # Ownership deregistration lives in _execute_claimed's context
             # manager, not here: this finally is unreachable from the pre-try
