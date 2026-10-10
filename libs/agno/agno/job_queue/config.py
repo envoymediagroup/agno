@@ -76,14 +76,14 @@ class QueueConfig:
 
     Multi-replica uniformity: the timing and budget fields
     (``lock_grace_seconds``, ``stop_timeout_seconds``, ``retention_seconds``,
-    ``max_attempts``, ``timeout_seconds``) must be configured UNIFORMLY across
-    every replica sharing one queue table. Each is applied by whichever
-    replica performs the action - the claimer's grace sets its heartbeat
-    cadence while the sweeper's grace judges staleness, ``max_attempts`` is
-    stamped per-ticket by the accepting replica, and the smallest
-    ``retention_seconds`` in the fleet wins the hourly cleanup - so divergent
-    values (including transiently, during a rolling deploy) can falsely sweep
-    a healthy peer's runs or delete tickets early. When changing
+    ``max_attempts``, ``timeout_seconds``, ``retry_interrupted_only``) must be
+    configured UNIFORMLY across every replica sharing one queue table. Each is
+    applied by whichever replica performs the action - the claimer's grace sets
+    its heartbeat cadence while the sweeper's grace judges staleness,
+    ``max_attempts`` is stamped per-ticket by the accepting replica, and the
+    smallest ``retention_seconds`` in the fleet wins the hourly cleanup - so
+    divergent values (including transiently, during a rolling deploy) can
+    falsely sweep a healthy peer's runs or delete tickets early. When changing
     ``lock_grace_seconds`` on a live fleet, only ever RAISE it, and roll the
     sweeping replicas first: a replica sweeping with a smaller grace than its
     peers heartbeat with judges their live leases stale.
@@ -170,6 +170,16 @@ class QueueConfig:
     # external agents) are serialized regardless. Custom stores enforce it by
     # setting serializes_sessions. (Appended last, see above.)
     queue_per_session: bool = True
+    # Spend the attempt budget (max_attempts) only on INTERRUPTED runs: a
+    # worker that died or lost its lease, or a shutdown drain that cancelled
+    # the run. A run that fails on its own - an ERROR result, a raised error,
+    # or timeout_seconds - fails on that attempt instead of executing again,
+    # so a deterministic failure (and its side effects) never repeats; retry
+    # transient model errors per model call instead. A failure the worker
+    # cannot record - its run-row or ticket write fails - leaves the lease to
+    # go stale like a crash, and is re-run like one. False retries both.
+    # Appended after queue_per_session for the same positional reason.
+    retry_interrupted_only: bool = False
 
     def __post_init__(self) -> None:
         if self.db is not None and not self.durable:
