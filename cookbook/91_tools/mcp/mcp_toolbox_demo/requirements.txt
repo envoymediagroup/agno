@@ -65,7 +65,7 @@ jsonschema==4.25.0
     # via mcp
 jsonschema-specifications==2025.4.1
     # via jsonschema
-mcp==1.12.2
+mcp==1.30.0
     # via mcp-toolbox-demo (pyproject.toml)
 multidict==6.6.3
     # via
