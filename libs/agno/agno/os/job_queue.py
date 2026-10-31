@@ -333,12 +333,43 @@ async def aenqueue_ticket(queue_worker: Any, job: Dict[str, Any], component: Any
     from agno.run.authorization import stamp_authorization
 
     job = {**job, "payload": stamp_authorization(job.get("payload"), include_trusted=True)}
+    job = {**job, "payload": with_legacy_component_version(job.get("component_type"), job.get("payload"))}
     from agno.company.execution import _enqueue_ticket
 
     config = queue_worker.config
     if config.queue_per_session or getattr(component, "one_turn_per_session", False) is True:
         job = {**job, "payload": {**(job.get("payload") or {}), "serialize_session": True}}
     return await _enqueue_ticket(queue_worker, job)
+
+
+# Transitional bridge between ticket formats. The envoymediagroup fork of
+# v3.1.2 queued a stored agent's run with its version as
+# payload["component_version"] and no scope; v3.1.12 resolves a db-backed
+# component only from payload["scope"]. Both builds share one queue table
+# while a deploy drains (or a rollback runs), so each must run the other's
+# stored-agent tickets. Retire once no worker of the old build runs, no
+# unfinished old-format ticket remains, and rolling back to it is off the table.
+LEGACY_COMPONENT_VERSION_KEY = "component_version"
+
+
+def legacy_ticket_scope(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The scope an old-format stored-agent ticket implies, or None for any
+    other ticket. The old build loaded stored agents with no user scope."""
+    payload = payload or {}
+    version = payload.get(LEGACY_COMPONENT_VERSION_KEY)
+    if payload.get("scope") or not isinstance(version, int) or isinstance(version, bool):
+        return None
+    return queue_scope(None, version, pinned=None, source="db")
+
+
+def with_legacy_component_version(component_type: Any, payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A db-backed agent's payload with its version also in the old format,
+    so a worker of the old build can run the ticket."""
+    scope = (payload or {}).get("scope") or {}
+    version = scope.get("version")
+    if component_type != "agent" or scope.get("source") != "db" or not isinstance(version, int):
+        return payload
+    return {**(payload or {}), LEGACY_COMPONENT_VERSION_KEY: version}
 
 
 def caller_run_id(kwargs: Dict[str, Any]) -> Optional[str]:
@@ -1279,7 +1310,8 @@ class QueueWorker:
         two-argument resolver keeps working; resolvers may be sync or async."""
         # component_type / component_id are required ticket fields (QueuedJob)
         component_type, component_id = job["component_type"], job["component_id"]
-        scope = (job.get("payload") or {}).get("scope")
+        payload = job.get("payload") or {}
+        scope = payload.get("scope") or legacy_ticket_scope(payload)
         if scope:
             resolved = self.resolve_component(component_type, component_id, scope=scope)
         else:
