@@ -4,7 +4,7 @@ All functions here are pure over an in-memory message list. Callers map chosen i
 stored-run coordinates.
 """
 
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from agno.compaction._tokens import estimate_message_tokens
 from agno.compaction.prompts import SUMMARY_PREFIX
@@ -39,18 +39,25 @@ def is_offload_envelope(message: Message) -> bool:
     return message.role == "tool" and isinstance(message.content, str) and message.content.startswith('<result id="')
 
 
-def keep_tail_start(messages: List[Message], keep_tokens: int, *, start: int = 0) -> int:
+def keep_tail_start(
+    messages: List[Message],
+    keep_tokens: int,
+    *,
+    start: int = 0,
+    estimate: Callable[[Message], int] = estimate_message_tokens,
+) -> int:
     """Index of the first message of a kept tail of ~keep_tokens, walking backward from the end.
 
     Injected summary/notice messages are not counted (they are regenerated per view, not kept
-    content). Returns start when the whole span fits.
+    content). Returns start when the whole span fits. ``estimate`` sizes one message, in the units
+    ``keep_tokens`` is in.
     """
     accumulated = 0
     index = len(messages)
     while index > start:
         candidate = messages[index - 1]
         if not is_injected_compaction_message(candidate):
-            accumulated += estimate_message_tokens(candidate)
+            accumulated += estimate(candidate)
             if accumulated > keep_tokens:
                 break
         index -= 1
@@ -93,6 +100,7 @@ def choose_boundary(
     keep_from_index: Optional[int] = None,
     min_index: int = 0,
     allow_tool_batch_heads: bool = True,
+    estimate: Callable[[Message], int] = estimate_message_tokens,
 ) -> Optional[int]:
     """Choose the boundary: the index of the first message kept verbatim.
 
@@ -112,7 +120,7 @@ def choose_boundary(
     if keep_from_index is not None:
         candidate = max(keep_from_index, floor_index)
     else:
-        candidate = keep_tail_start(messages, keep_tokens or 0, start=floor_index)
+        candidate = keep_tail_start(messages, keep_tokens or 0, start=floor_index, estimate=estimate)
     if candidate <= floor_index:
         return None
     # An oversized newest message can push the walk past the end; a tail of at least one message

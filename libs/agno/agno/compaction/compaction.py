@@ -7,7 +7,14 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union, c
 from uuid import uuid4
 
 from agno.compaction._cut import choose_boundary, is_offload_envelope
-from agno.compaction._tokens import TokenCounter, count_request, estimate_tokens, is_async_callable
+from agno.compaction._tokens import (
+    TokenCounter,
+    TokenEstimator,
+    count_request,
+    estimate_message_tokens,
+    estimate_tokens,
+    is_async_callable,
+)
 from agno.compaction._view import build_view
 from agno.compaction.archive import CompactionArchive, render_message, render_messages, search_terms
 from agno.compaction.prompts import (
@@ -129,6 +136,13 @@ class Compaction:
     #   Hugging Face tokenizer for an open-weight model. An async one is awaited in async runs and
     #   fails a sync run, which has nothing to await it with.
     token_counter: Optional[TokenCounter] = None
+    # How every size a fold works with is estimated: the kept tail, the system prompt and tools it
+    # shares the threshold with, the summary's room, and the tokens_before and tokens_after it
+    # records. A local, sync function taking (messages, tools) and returning an int, called many
+    # times per fold. Unset, the local tiktoken estimate. Set it with token_counter when that counts
+    # in units the local estimate doesn't match, so a fold sized in other units doesn't land over
+    # the threshold it was measured against.
+    estimator: Optional[TokenEstimator] = None
 
     # -- what to keep ---------------------------------------------------
     # Recent runs kept verbatim.
@@ -189,6 +203,11 @@ class Compaction:
                 f"token_counter must be a function taking (messages, tools) and returning an int, "
                 f"got {type(self.token_counter).__name__}"
             )
+        if self.estimator is not None and (not callable(self.estimator) or is_async_callable(self.estimator)):
+            raise TypeError(
+                f"estimator must be a sync function taking (messages, tools) and returning an int, "
+                f"got {type(self.estimator).__name__}"
+            )
         if self.use_model_token_count and self.token_counter is not None:
             raise ValueError(
                 "use_model_token_count and token_counter cannot both be set - each chooses how tokens are "
@@ -231,6 +250,28 @@ class Compaction:
         # compact_at_tokens=None is legal: it disables the automatic trigger and leaves
         # agent.compact() as the only way to fold, which is a coherent way to run this.
 
+    # -- sizes ----------------------------------------------------------
+
+    def estimate(self, messages: List[Message], tools: Optional[List[Any]] = None) -> int:
+        """The local size of ``messages`` and ``tools``, by ``estimator`` when one is set."""
+        if self.estimator is None:
+            return estimate_tokens(messages, tools)
+        return int(self.estimator(list(messages), list(tools) if tools else None))
+
+    def _estimate_message(self, message: Message) -> int:
+        if self.estimator is None:
+            return estimate_message_tokens(message)
+        return self.estimate([message])
+
+    def _estimate_text(self, text: str, model_id: str = "gpt-4o") -> int:
+        """A text's size, such as a summary's. ``model_id`` picks the local tokenizer when no
+        estimator is set; an estimator sizes the text as the assistant message a summary is."""
+        if self.estimator is None:
+            from agno.utils.tokens import count_text_tokens
+
+            return count_text_tokens(text, model_id)
+        return self.estimate([Message(role="assistant", content=text)])
+
     # -- thresholds -----------------------------------------------------
 
     def _measured_tokens(
@@ -255,6 +296,8 @@ class Compaction:
             if counted is not None:
                 return counted
         try:
+            if self.estimator is not None:
+                return self.estimate(messages, tools)
             from agno.utils.tokens import count_tokens
 
             return count_tokens(messages, tools=tools, model_id=self._tokenizer_model_id(model))
@@ -388,9 +431,7 @@ class Compaction:
         if self.compacted_token_budget is not None:
             return self.compacted_token_budget
         if previous is not None and previous.summary:
-            from agno.utils.tokens import count_text_tokens
-
-            return count_text_tokens(previous.summary)
+            return self._estimate_text(previous.summary)
         return 0
 
     @property
@@ -415,7 +456,7 @@ class Compaction:
             # pair-safe turn boundary like any other cut.
             limit = self._tail_limit_after(overhead_tokens)
             budget = self.uncompacted_tokens if limit is None else min(self.uncompacted_tokens, limit)
-            cut = choose_boundary(messages, keep_tokens=budget, min_index=min_index)
+            cut = choose_boundary(messages, keep_tokens=budget, min_index=min_index, estimate=self._estimate_message)
             return self._outside_newest_exchange(messages, cut, min_index)
         return self._run_tail_boundary(messages, min_index, overhead_tokens)[0]
 
@@ -451,10 +492,12 @@ class Compaction:
         if limit is None:
             return boundary, False
         tail_start = min_index if boundary is None else boundary
-        if estimate_tokens(messages[tail_start:]) <= limit:
+        if self.estimate(messages[tail_start:]) <= limit:
             return boundary, False
         cut = self._outside_newest_exchange(
-            messages, choose_boundary(messages, keep_tokens=limit, min_index=min_index), min_index
+            messages,
+            choose_boundary(messages, keep_tokens=limit, min_index=min_index, estimate=self._estimate_message),
+            min_index,
         )
         if cut is None or cut <= tail_start:
             return boundary, False
@@ -492,7 +535,7 @@ class Compaction:
         # Compared with the overhead's share alone: a tighter limit from enforce_min_fold_ratio is
         # a choice, not a sign the threshold is too small.
         room = self.compact_at_tokens - overhead_tokens
-        if estimate_tokens(messages[newest:]) <= max(room // 2, 0):
+        if self.estimate(messages[newest:]) <= max(room // 2, 0):
             return
         log_warning(
             f"Compaction: compact_at_tokens={self.compact_at_tokens} leaves {max(room, 0)} tokens after the "
@@ -582,10 +625,8 @@ class Compaction:
         if budget is None or not self.enforce_token_budget:
             return summary
 
-        from agno.utils.tokens import count_text_tokens
-
         model_id = self._tokenizer_model_id()
-        before = count_text_tokens(summary, model_id)
+        before = self._estimate_text(summary, model_id)
         if before <= budget:
             return summary
 
@@ -598,7 +639,7 @@ class Compaction:
             return "\n".join(kept + ["", note]) if kept else note
 
         def fits(text: str) -> bool:
-            return count_text_tokens(text, model_id) <= budget
+            return self._estimate_text(text, model_id) <= budget
 
         def longest(count: int, fits_with: "Callable[[int], bool]") -> int:
             # The most leading items that fit. Longer prefixes only grow, so search for it.
@@ -628,7 +669,7 @@ class Compaction:
             fitted = " ".join(words[: longest(len(words), lambda n: fits(" ".join(words[:n])))])
         log_info(
             f"Compaction: the summary was {before} tokens against a {budget}-token budget, so it was cut to "
-            f"{count_text_tokens(fitted, model_id)} tokens."
+            f"{self._estimate_text(fitted, model_id)} tokens."
         )
         return fitted
 
@@ -772,14 +813,19 @@ class Compaction:
         Both sides are counted locally over the two lists this fold turned into each other, so the
         numbers are comparable and the measurement costs nothing. ``Model.count_tokens`` is
         deliberately not used: on some providers it is a network round trip, and OpenAI rejects a
-        list with no user message - which is exactly the shape a folded list can have.
+        list with no user message - which is exactly the shape a folded list can have. An
+        ``estimator`` measures both sides instead, so they are in the threshold's units.
         """
         from agno.utils.tokens import count_tokens
 
         model_id = self._tokenizer_model_id()
         try:
-            record.tokens_before = count_tokens(before, model_id=model_id)
-            record.tokens_after = count_tokens(after, model_id=model_id)
+            if self.estimator is not None:
+                record.tokens_before = self.estimate(before)
+                record.tokens_after = self.estimate(after)
+            else:
+                record.tokens_before = count_tokens(before, model_id=model_id)
+                record.tokens_after = count_tokens(after, model_id=model_id)
         except Exception:  # noqa: BLE001 - a measurement must never fail a run
             pass
 
@@ -844,8 +890,8 @@ class Compaction:
         """
         if self._fold_ratio <= 0:
             return True
-        fold_tokens = estimate_tokens([m for m in to_compact if not is_offload_envelope(m)])
-        keep_tokens = max(estimate_tokens([m for m in kept if not is_offload_envelope(m)]), 1)
+        fold_tokens = self.estimate([m for m in to_compact if not is_offload_envelope(m)])
+        keep_tokens = max(self.estimate([m for m in kept if not is_offload_envelope(m)]), 1)
         ratio = fold_tokens / keep_tokens
         if ratio < self._fold_ratio:
             # log_info, not debug: a threshold was crossed and the user was told so. Going
@@ -909,8 +955,8 @@ class Compaction:
             # Carry the numbers, not just the verdict: "not worth it" with no figures leaves a
             # caller unable to tell a fold that missed by a hair from one that was never close,
             # and the ratio is the one thing that says which lever to reach for.
-            fold_tokens = estimate_tokens([m for m in messages[already:boundary] if not is_offload_envelope(m)])
-            keep_tokens = max(estimate_tokens([m for m in messages[boundary:] if not is_offload_envelope(m)]), 1)
+            fold_tokens = self.estimate([m for m in messages[already:boundary] if not is_offload_envelope(m)])
+            keep_tokens = max(self.estimate([m for m in messages[boundary:] if not is_offload_envelope(m)]), 1)
             return (
                 None,
                 CompactionStatus.NOT_WORTH_IT,
@@ -948,7 +994,7 @@ class Compaction:
         # What the kept tail shares the threshold with: the system prompt and tools in front of the
         # history, measured from context_prefix when the caller has not counted them.
         if overhead_tokens is None:
-            overhead_tokens = estimate_tokens(context_prefix) if context_prefix else 0
+            overhead_tokens = self.estimate(context_prefix) if context_prefix else 0
         boundary = self.plan(messages, previous, overhead_tokens)
         if boundary is None:
             return None
@@ -1008,7 +1054,7 @@ class Compaction:
         # What the kept tail shares the threshold with: the system prompt and tools in front of the
         # history, measured from context_prefix when the caller has not counted them.
         if overhead_tokens is None:
-            overhead_tokens = estimate_tokens(context_prefix) if context_prefix else 0
+            overhead_tokens = self.estimate(context_prefix) if context_prefix else 0
         boundary = self.plan(messages, previous, overhead_tokens)
         if boundary is None:
             return None
