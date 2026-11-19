@@ -3,7 +3,9 @@
 Estimates here are always computed locally (tiktoken or a character heuristic) - never via the
 provider ``count_tokens`` overrides, several of which are a network call per invocation. A user
 who wants a different count supplies it as ``Compaction.token_counter``; ``count_request`` runs it
-and falls back to these estimates when it is absent or fails.
+and falls back to these estimates when it is absent or fails. A user who wants every size
+compaction works with in another unit supplies a local estimate of their own as
+``Compaction.estimator``.
 """
 
 import inspect
@@ -15,6 +17,10 @@ from agno.utils.log import log_warning
 # Counts the tokens of a request: its messages and, when given, its tool definitions. It may be
 # async, for agents run with arun.
 TokenCounter = Callable[[List[Message], Optional[List[Any]]], Union[int, Awaitable[int]]]
+
+# Estimates the tokens of messages and, when given, tool definitions, locally and synchronously:
+# compaction calls it many times per fold, on slices of one message list as well as whole requests.
+TokenEstimator = Callable[[List[Message], Optional[List[Any]]], int]
 
 # An async counter can be awaited only where there is an event loop to await it on.
 ASYNC_COUNTER_IN_SYNC_RUN = (

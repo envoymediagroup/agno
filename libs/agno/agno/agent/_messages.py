@@ -118,7 +118,10 @@ def _estimated_context_tokens(
     if counted is not None:
         return counted
     model_id = getattr(agent.model, "id", None) or "gpt-4o"
+    compaction = agent_compaction(agent)
     try:
+        if compaction is not None and compaction.estimator is not None:
+            return compaction.estimate(messages, tools)
         return count_tokens(messages, tools=tools, model_id=model_id)
     except Exception as e:  # noqa: BLE001 - token estimation must never fail a run
         log_warning(f"Could not estimate tokens for compaction: {e}")
@@ -175,21 +178,27 @@ async def _acount(agent: "Agent", messages: List[Message], tools: Optional[List[
     return await acount_request(getattr(compaction, "token_counter", None), messages, tools)
 
 
+def _local_estimate(agent: "Agent", messages: List[Message], tools: Optional[List[Any]] = None) -> int:
+    """A local size, in the units of the agent's Compaction.estimator when it sets one."""
+    from agno.compaction._tokens import estimate_tokens
+
+    compaction = agent_compaction(agent)
+    return compaction.estimate(messages, tools) if compaction is not None else estimate_tokens(messages, tools)
+
+
 def _request_tokens(agent: "Agent", messages: List[Message], tools: Optional[List[Any]]) -> int:
     """A request's size for overflow recovery, counted the way the trigger counts it, so before and
     after are comparable."""
-    from agno.compaction._tokens import count_request, estimate_tokens
+    from agno.compaction._tokens import count_request
 
     counted = count_request(_sync_counter(agent), messages, tools)
-    return counted if counted is not None else estimate_tokens(messages, tools)
+    return counted if counted is not None else _local_estimate(agent, messages, tools)
 
 
 async def _arequest_tokens(agent: "Agent", messages: List[Message], tools: Optional[List[Any]]) -> int:
     """``_request_tokens`` for async runs."""
-    from agno.compaction._tokens import estimate_tokens
-
     counted = await _acount(agent, messages, tools)
-    return counted if counted is not None else estimate_tokens(messages, tools)
+    return counted if counted is not None else _local_estimate(agent, messages, tools)
 
 
 def _log_compaction(record: Any) -> None:
@@ -550,7 +559,6 @@ def _plan_overflow_fold(agent: "Agent", run_messages: Any) -> Optional[Tuple[Any
     from dataclasses import replace
 
     from agno.compaction._cut import leading_system_count
-    from agno.compaction._tokens import estimate_tokens
 
     compaction = agent_compaction(agent)
     if compaction is None or not getattr(compaction, "on_context_overflow", False):
@@ -577,13 +585,15 @@ def _plan_overflow_fold(agent: "Agent", run_messages: Any) -> Optional[Tuple[Any
             candidate = compaction
         else:
             candidate = replace(compaction, uncompacted_runs=keep, stats=compaction.stats)
-        boundary = candidate.boundary_for(messages, min_index=lead, overhead_tokens=estimate_tokens(messages[:lead]))
+        boundary = candidate.boundary_for(
+            messages, min_index=lead, overhead_tokens=compaction.estimate(messages[:lead])
+        )
         if boundary is None or boundary <= lead:
             continue
         folder, chosen_keep = candidate, keep
         # Stop as soon as the fold is large enough to be worth a summarizer call, rather than
         # shrinking the tail further than the rejection requires.
-        if estimate_tokens(messages[lead:boundary]) >= estimate_tokens(messages[boundary:]):
+        if compaction.estimate(messages[lead:boundary]) >= compaction.estimate(messages[boundary:]):
             break
     if folder is not None and chosen_keep != compaction.uncompacted_runs:
         log_info(
@@ -636,7 +646,6 @@ def _overflow_fold_kwargs(
     agent: "Agent", session: AgentSession, run_response: Optional[RunOutput], before: int, messages: List[Message]
 ) -> Dict[str, Any]:
     from agno.compaction._cut import leading_system_count
-    from agno.compaction._tokens import estimate_tokens
 
     return dict(
         session_id=session.session_id,
@@ -648,7 +657,7 @@ def _overflow_fold_kwargs(
         tokens_before=before,
         # The leading system messages are part of the list being folded; counting them keeps the
         # cut the same as the one the overflow planner chose.
-        overhead_tokens=estimate_tokens(messages[: leading_system_count(messages)]),
+        overhead_tokens=_local_estimate(agent, messages[: leading_system_count(messages)]),
     )
 
 
@@ -756,9 +765,7 @@ def apply_compaction(
     # pair-safe boundary or the size floor, so announcing on it alone reports
     # compactions that then never happen.
     # The system prompt and tools share the threshold with whatever the fold keeps.
-    from agno.compaction._tokens import estimate_tokens
-
-    overhead = estimate_tokens(prefix, tools) if (prefix or tools) else 0
+    overhead = compaction.estimate(prefix, tools) if (prefix or tools) else 0
     if compaction.plan(history, record, overhead) is None:
         return in_context
 
@@ -829,9 +836,7 @@ async def aapply_compaction(
     # pair-safe boundary or the size floor, so announcing on it alone reports
     # compactions that then never happen.
     # The system prompt and tools share the threshold with whatever the fold keeps.
-    from agno.compaction._tokens import estimate_tokens
-
-    overhead = estimate_tokens(prefix, tools) if (prefix or tools) else 0
+    overhead = compaction.estimate(prefix, tools) if (prefix or tools) else 0
     if compaction.plan(history, record, overhead) is None:
         return in_context
 

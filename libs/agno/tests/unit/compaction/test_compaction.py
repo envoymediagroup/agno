@@ -2982,6 +2982,149 @@ def test_no_model_still_uses_local_estimate():
     assert c._measured_tokens(_transcript(), None, None) > 0
 
 
+# --- estimator ---------------------------------------------------------------
+
+
+def _per_message(tokens):
+    """An estimator charging a flat ``tokens`` per message and 1_000 per tool, whatever they hold."""
+
+    def estimator(messages, tools):
+        return tokens * len(messages) + 1_000 * len(tools or [])
+
+    return estimator
+
+
+def test_an_estimator_sizes_the_kept_tail():
+    """A token tail is walked in the estimator's units: at 1_000 a message, a 2_500-token tail
+    holds two messages, where the local estimate would keep the whole short transcript."""
+    messages = _runs_of(6, answer_words=5)
+
+    local = Compaction(uncompacted_tokens=2_500, compact_at_tokens=None).boundary_for(messages)
+    counted = Compaction(uncompacted_tokens=2_500, compact_at_tokens=None, estimator=_per_message(1_000)).boundary_for(
+        messages
+    )
+
+    assert local is None
+    assert counted == len(messages) - 2
+
+
+def test_an_estimator_sizes_the_tail_limit_a_run_tail_is_cut_to():
+    """The tail limit a run-count tail is cut to is checked in the estimator's units too: five runs
+    of 10 messages' worth each pass a 4_000-token threshold's limit and are cut to fit it."""
+    messages = _runs_of(10, answer_words=5)
+
+    cut = Compaction(compact_at_tokens=4_000, estimator=_per_message(1_000)).boundary_for(messages)
+
+    assert cut == len(messages) - 2
+
+
+def test_an_estimator_sizes_the_previous_summarys_room():
+    previous = CompactionRecord(messages_compacted=4, summary="word " * 100, first_kept_message_id="x")
+
+    assert Compaction(estimator=_per_message(321))._summary_allowance(previous) == 321
+
+
+def test_an_estimator_measures_tokens_before_and_after():
+    """The sizes a fold records are in the estimator's units, as the threshold it was triggered at."""
+    messages = _runs_of(12)
+    prefix = [Message(role="system", content="sys")]
+
+    record = Compaction(
+        compact_at_tokens=None,
+        uncompacted_runs=2,
+        store_compacted_messages=False,
+        model=_StubModel(),
+        estimator=_per_message(10),
+    ).compact(messages, session_id="s", context_prefix=prefix)
+
+    assert record is not None
+    assert record.tokens_before == 10 * (1 + len(messages))
+    assert record.tokens_after == 10 * (1 + 1 + 4)
+
+
+def test_an_estimator_sizes_the_overhead_a_fold_shares_the_threshold_with():
+    """The system prompt and tools in front of the history are sized by the estimator: at 1_000
+    a tool, they leave no room under a 3_000-token threshold, so the fold keeps only the newest
+    exchange."""
+    from agno.agent import Agent
+    from agno.agent._messages import apply_compaction
+    from agno.session.agent import AgentSession
+
+    history = _runs_of(10, answer_words=5)
+    agent = Agent(
+        compaction=Compaction(
+            compact_at_tokens=3_000,
+            store_compacted_messages=False,
+            model=_StubModel(),
+            token_counter=lambda messages, tools: 10_000,
+            estimator=_per_message(1),
+        )
+    )
+
+    tools = [{"type": "function", "function": {"name": f"t{i}"}} for i in range(3)]
+    compacted = apply_compaction(
+        agent,
+        AgentSession(session_id="s", runs=[]),
+        history,
+        None,
+        context_prefix=[Message(role="system", content="sys")],
+        tools=tools,
+    )
+
+    assert [m.id for m in compacted if m.id in {message.id for message in history}] == ["u9", "a9"]
+
+
+def test_overflow_recovery_without_a_counter_sizes_the_request_with_the_estimator(caplog):
+    from agno.agent import Agent
+    from agno.agent._messages import _recompact_after_overflow
+    from agno.session.agent import AgentSession
+
+    class _RunMessages:
+        def __init__(self, messages):
+            self.messages = messages
+
+    messages = [Message(role="system", content="sys", id="s0")] + _runs_of(30)
+    run_messages = _RunMessages(messages)
+    agent = Agent(
+        compaction=Compaction(
+            uncompacted_runs=5,
+            store_compacted_messages=False,
+            model=_StubModel(),
+            on_context_overflow=True,
+            estimator=_per_message(100),
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger="agno"):
+        assert _recompact_after_overflow(agent, AgentSession(session_id="s1", runs=[]), run_messages, None)
+    assert any(f"(6100 -> {100 * len(run_messages.messages)} tokens)" in r.message for r in caplog.records)
+
+
+def test_the_trigger_falls_back_to_the_estimator_when_no_counter_counts():
+    from agno.agent import Agent
+    from agno.agent._messages import _estimated_context_tokens
+
+    agent = Agent(compaction=Compaction(estimator=_per_message(7)))
+
+    assert _estimated_context_tokens(agent, _transcript(), [{"type": "function", "function": {"name": "t"}}]) == (
+        7 * len(_transcript()) + 1_000
+    )
+
+
+@pytest.mark.parametrize("estimator", [1_000, "estimate"])
+def test_estimator_must_be_a_function(estimator):
+    with pytest.raises(TypeError, match="estimator"):
+        Compaction(estimator=estimator)  # type: ignore[arg-type]
+
+
+def test_estimator_must_be_sync():
+    async def estimator(messages, tools):
+        return 1
+
+    with pytest.raises(TypeError, match="estimator must be a sync function"):
+        Compaction(estimator=estimator)  # type: ignore[arg-type]
+
+
 # --- tail selection ---------------------------------------------------------
 
 
